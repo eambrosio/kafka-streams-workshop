@@ -5,9 +5,11 @@ import java.util.Collections
 import JavaSessionize.avro.{Sale, SaleAndStore}
 import io.confluent.kafka.serializers.AbstractKafkaAvroSerDeConfig
 import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde
-import org.apache.kafka.common.serialization.Serdes
-import org.apache.kafka.streams.kstream.Consumed
-import org.apache.kafka.streams.{StreamsBuilder, Topology}
+import org.apache.kafka.common.serialization.{Serde, Serdes}
+import org.apache.kafka.streams.Topology
+import org.apache.kafka.streams.scala.ImplicitConversions._
+import org.apache.kafka.streams.scala.StreamsBuilder
+import org.apache.kafka.streams.scala.kstream.KStream
 
 object EnrichmentTopologyBuilder {
 
@@ -32,21 +34,41 @@ object EnrichmentTopologyBuilder {
     specificAvroSerde
   }
 
+
   def createTopology(schemaRegistryHost: String,
-                     schemaRegistryPort: String,
-                     inputTopic: String,
-                     outputTopic: String,
-                     outputTopicError: String): Topology = {
+    schemaRegistryPort: String,
+    inputTopic: String,
+    outputTopic: String,
+    outputTopicError: String): Topology = {
+
+    implicit val serdes: Serde[String] = Serdes.String()
+    implicit val avroSaleSerde: SpecificAvroSerde[Sale] = getAvroSaleSerde(schemaRegistryHost, schemaRegistryPort)
+    implicit val avroSaleAndStoreSerde: SpecificAvroSerde[SaleAndStore] = getAvroSaleAndStoreSerde(schemaRegistryHost, schemaRegistryPort)
+
+    val existsStoreId: (String, Sale) => Boolean = (_, sale) => storesInformation.contains(sale.getStoreid)
+
+    val notExistsStoreId: (String, Sale) => Boolean = (_, sale) => !storesInformation.contains(sale.getStoreid)
 
 
     val builder = new StreamsBuilder()
-    val initialStream = builder.stream(inputTopic, Consumed.`with`(Serdes.String(), getAvroSaleSerde(schemaRegistryHost, schemaRegistryPort)))
+    val initialStream: KStream[String, Sale] = builder.stream(inputTopic)
 
     //TODO: Check out whether the store id from the sales event exists within the storesInformation hashmap. If it exists you should modify the event,
     // convert it to a SaleAndStore object and redirect it to the outputTopic topic. If it does not exist you should redirect the event to the outputTopicError topic.
 
-    initialStream.to(outputTopic)
-    initialStream.to(outputTopicError)
+    val splittedStream: Array[KStream[String, Sale]] = initialStream.branch(existsStoreId, notExistsStoreId)
+
+    val saleAndStoreStream: KStream[String, SaleAndStore] = splittedStream(0)
+      .mapValues[SaleAndStore]((sale: Sale) => new SaleAndStore(
+      sale.getAmount,
+      sale.getProduct,
+      storesInformation(sale.getStoreid).storeAddress,
+      storesInformation(sale.getStoreid).storeCity))
+
+    val errorStream = splittedStream(1)
+
+    saleAndStoreStream.to(outputTopic)
+    errorStream.to(outputTopicError)
 
     builder.build()
   }
